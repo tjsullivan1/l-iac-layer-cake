@@ -1,0 +1,122 @@
+name: Bicep CI 
+ 
+# Controls when the workflow will run 
+on: 
+  # Triggers the workflow on push or pull request events but only for the main branch 
+  push: 
+    branches: [ main ] 
+  pull_request: 
+    branches: [ main ] 
+ 
+  # Allows you to run this workflow manually from the Actions tab 
+  workflow_dispatch: 
+ 
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel 
+jobs: 
+  # This workflow contains a single job called "build" 
+  build: 
+    # The type of runner that the job will run on 
+    runs-on: ubuntu-latest 
+ 
+    # Steps represent a sequence of tasks that will be executed as part of the job 
+    steps: 
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it 
+      - uses: actions/checkout@v2 
+        with:  
+# This was necessary to get the correctly modified files to show with the git log.  
+          fetch-depth: 0 
+ 
+      - name: 'Az CLI login' 
+        uses: azure/login@v1 
+        with: 
+          creds: ${{ secrets.AZURE_CREDENTIALS }} 
+ 
+      - uses: azure/docker-login@v1 
+        with: 
+          login-server: ${{ secrets.acr_login_server }} # default: index.docker.io 
+          username: ${{ secrets.acr_service_principal }} 
+          password: ${{ secrets.acr_sp_password }} 
+ 
+      # Runs a set of commands using the runners shell 
+      - name: Get Current Image Version & Build New Version 
+        run: | 
+ 
+          get_version_and_build () { 
+            acr_name=$1 
+            msg=$2 
+            file=$3 
+ 
+            echo "DEBUG: IN FUNCTION! working on file $file" 
+ 
+            current_latest_json=`az acr repository show-tags --name $acr_name --repository bicep/modules/acr -o json || $null` 
+ 
+            if [[ -z $current_latest_json ]] 
+            then 
+              echo "This version does not yet exist in ACR. Please manually create teh image in ACR first." 
+            else 
+              echo "DEBUG: this repo $file did exist in acr" 
+ 
+              # we rely on semantic versioning to assume sorting will work correctly. 
+              current_latest=`echo $current_latest_json | jq '.[]' | tr -d '"' | sort -rV | head -1` 
+ 
+              # Read Semver fields 
+              echo $current_latest 
+              IFS=. read -r major minor patch <<<"$current_latest" 
+ 
+              if [[ "$msg" =~ ^version.* ]]; then 
+                major="$((major + 1))" 
+                minor="0" 
+                patch="0" 
+              elif [[ "$msg" =~ ^feat.* ]]; then 
+                minor="$((minor + 1))" 
+                patch="0" 
+              else 
+                # Increment patch version 
+                patch="$((patch + 1))" 
+              fi 
+ 
+              # Re-assemble version string from Semver fields 
+              printf -v new_version '%d.%d.%d' "$major" "$minor" "$patch" 
+              echo $new_version 
+ 
+              mod_name=`echo $file | sed 's/infrastructure_templates\/bicep\///' | cut -f1 -d'.'` 
+              target="br:$acr_name.azurecr.io/bicep/modules/$mod_name:$new_version" 
+ 
+              echo "DEBUG: file is $file" 
+              echo "DEBUG: target is $target" 
+             
+              # This script will only work on existing image repos. We will test this and set to null otherwise 
+              az bicep publish --file $file --target $target 
+            fi 
+          } 
+ 
+          # The pattern here is to expect a commit message to begin with "version" if we are bumping major and "feat" if minor 
+          # otherwise, we will increment patch versions 
+          msg="${{ github.event.head_commit.message }}" 
+ 
+          acr_name="${{ secrets.acr_short_name }}" 
+ 
+          # The first grep, \| is to find files in the git log that were modified to prevent me from finding the commit message if it contains .bicep 
+          files=`git log --stat -n1 --oneline | grep \| | grep .bicep | awk -F\| '{print $1}' | tr -d [:blank:]` 
+ 
+          # In practice, this will loop through all the modified bicep files returned from our git log.
+          # It passes these to the get_version_and_build, which looks for a module with a matching name in our ACR. If it doesn't exist, we complete without modifying.
+          # Please note, the expectation is that you are going to pass a modified bicep file that exists within the infrastructure_templates/bicep directory.
+          # The expectation is that you are using pseudo-semantically versioned modules (i.e., major.minor.patch). Thes will then follow a natural sort to grab the most recent version (based on highest version number).
+          # Versions then are incremented based on commit:
+          #    - If a commit message starts with the word ‘version’, a major version will occur (i.e., 1.0.0 → 2.0.0). 
+          #    - If a commit message starts with the word ‘feat’, a minor version will occur (i.e., 1.1.0 → 1.2.0 
+          #    - If neither of the previous are matched, a patch version will occur (i.e., 1.1.0 → 1.1.1). 
+          echo "DEBUG: Files are $files" 
+          if [[ -z $files ]] 
+          then 
+            echo "No bicep files have been updated." 
+          else 
+            echo "DEBUG: supposedly the files exist" 
+            for file in $files 
+            do 
+              echo "DEBUG: working on file $file" 
+              az bicep install 
+              get_version_and_build "$acr_name" "$msg" "$file" 
+            done 
+          fi 
